@@ -85,10 +85,11 @@ impl<'tcx> LateLintPass<'tcx> for ProjectHelper {
             params,
             calls,
         };
-        let path: rustc_hir::def_id::DefId = lid.to_def_id();
+        let def_id: rustc_hir::def_id::DefId = lid.to_def_id();
         
         println!("Body {:#?}", body);
-        println!("DefId {:#?}", path);
+        println!("DefId {:#?}", def_id);
+        println!("Path {:#?}\n", cx.tcx.def_path_str(def_id));
         println!("Fnitem {:#?}\n", fi);
     }
 }
@@ -183,6 +184,7 @@ fn get_call_in_qpath<'tcx>(qpath: &'tcx QPath<'tcx>) -> anyhow::Result<ItemFn> {
                 };
                 let name = ps.ident.name.to_string();
                 let span = format!("{:?}", ps.ident.span);
+                let res = ps.res;
                 ItemFn {
                     name,
                     span,
