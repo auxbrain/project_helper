@@ -75,7 +75,8 @@ impl<'tcx> LateLintPass<'tcx> for ProjectHelper {
         };
         let tree = sled::open("ph").unwrap();
         let jfi = serde_json::to_string(&fi).unwrap();
-        tree.insert(def_id.clone(), jfi.as_bytes()).unwrap();
+        let key = format!("fn_{}",def_id);
+        tree.insert(key, jfi.as_bytes()).unwrap();
         tree.flush().unwrap();
         println!("def_id {:?}", def_id);
         println!("Body {:#?}", body);
