@@ -2,8 +2,8 @@
 #![feature(let_chains)]
 #![warn(unused_extern_crates)]
 
-extern crate rustc_span;
 extern crate rustc_hir;
+extern crate rustc_span;
 // extern crate rustc_data_structures;
 // extern crate rustc_errors;
 // extern crate rustc_middle;
@@ -62,41 +62,53 @@ impl<'tcx> LateLintPass<'tcx> for ProjectHelper {
             FnKind::ItemFn(i, _g, _h) => (i.to_string(), format!("{:?}", span)),
             FnKind::Closure => ("Closure".to_string(), format!("{:?}", span)),
         };
-        let param_tys = dec
-            .inputs
-            .iter()
-            .map(|v| get_rel_struct_in_ty(v).unwrap_or_else(|e| format!("{:?}", e)))
-            .collect::<Vec<_>>();
-        let params = body
-            .params
-            .iter()
-            .enumerate()
-            .map(|(index, param)| {
-                let name = snippet(cx, param.pat.span, "..").to_string();
-                model::FnParam {
-                    name,
-                    ty: param_tys
-                        .get(index)
-                        .cloned()
-                        .unwrap_or("unknown".to_string()),
-                }
-            })
-            .collect::<Vec<_>>();
+        let params = get_type_by_desc(cx, dec, body);
         let mut calls = Vec::new();
         scan_call_in_body(cx, &mut calls, body);
         let def_id = format!("{:?}", lid.to_def_id());
-        println!("def_id {:?}", def_id);
         let fi = model::FnItem {
             name,
             span,
             params,
             calls,
-            def_id,
+            def_id: def_id.clone(),
         };
-
+        let tree = sled::open("ph").unwrap();
+        let jfi = serde_json::to_string(&fi).unwrap();
+        tree.insert(def_id.clone(), jfi.as_bytes()).unwrap();
+        tree.flush().unwrap();
+        println!("def_id {:?}", def_id);
         println!("Body {:#?}", body);
         println!("Fnitem {:#?}\n", fi);
     }
+}
+
+fn get_type_by_desc<'tcx>(
+    cx: &LateContext<'tcx>,
+    dec: &'tcx FnDecl<'tcx>,
+    body: &'tcx Body<'tcx>,
+) -> Vec<model::FnParam> {
+    let param_tys = dec
+        .inputs
+        .iter()
+        .map(|v| get_rel_struct_in_ty(v).unwrap_or_else(|e| format!("{:?}", e)))
+        .collect::<Vec<_>>();
+    let params = body
+        .params
+        .iter()
+        .enumerate()
+        .map(|(index, param)| {
+            let name = snippet(cx, param.pat.span, "..").to_string();
+            model::FnParam {
+                name,
+                ty: param_tys
+                    .get(index)
+                    .cloned()
+                    .unwrap_or("unknown".to_string()),
+            }
+        })
+        .collect::<Vec<_>>();
+    params
 }
 
 fn scan_call_in_stmt<'tcx>(cx: &LateContext<'tcx>, calls: &mut Vec<Call>, stmt: &'tcx Stmt<'tcx>) {
