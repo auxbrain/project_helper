@@ -2,42 +2,35 @@
 #![feature(let_chains)]
 #![warn(unused_extern_crates)]
 
-extern crate rustc_arena;
-extern crate rustc_ast;
-extern crate rustc_ast_pretty;
-extern crate rustc_attr;
-extern crate rustc_data_structures;
-extern crate rustc_errors;
-extern crate rustc_hir;
-extern crate rustc_hir_pretty;
-extern crate rustc_index;
-extern crate rustc_infer;
-extern crate rustc_lexer;
-extern crate rustc_middle;
-extern crate rustc_mir_dataflow;
-extern crate rustc_parse;
 extern crate rustc_span;
-extern crate rustc_target;
-extern crate rustc_trait_selection;
+extern crate rustc_hir;
+// extern crate rustc_data_structures;
+// extern crate rustc_errors;
+// extern crate rustc_middle;
+// extern crate rustc_hir_pretty;
+// extern crate rustc_index;
+// extern crate rustc_infer;
+// extern crate rustc_lexer;
+// extern crate rustc_arena;
+// extern crate rustc_ast;
+// extern crate rustc_ast_pretty;
+// extern crate rustc_attr;
+// extern crate rustc_mir_dataflow;
+// extern crate rustc_parse;
+// extern crate rustc_target;
+// extern crate rustc_trait_selection;
 
 mod model;
 
-use clippy_utils::{
-    def_path_def_ids, diagnostics::span_lint_and_sugg, path_to_local_id, source::snippet, ty::{is_copy, peel_mid_ty_refs}
-};
-use model::{Call, ItemFn, Method};
-use rustc_data_structures::fx::FxHashSet;
-use rustc_errors::Applicability;
+use clippy_utils::source::snippet;
+use model::{Call, ItemFnCall, MethodCall};
+use rustc_hir::{def::Res, Ty};
 use rustc_hir::{
-    def_id::LocalDefId,
-    intravisit::{walk_expr, FnKind, Visitor},
-    BindingAnnotation, Body, ByRef, Expr, ExprKind, FnDecl, HirId, Local, Node, Pat, PatKind,
-    QPath, Stmt, StmtKind, TyKind, UnOp,
+    def_id::LocalDefId, intravisit::FnKind, Body, Expr, ExprKind, FnDecl, HirId, Local, QPath,
+    Stmt, StmtKind, TyKind,
 };
-use rustc_lint::{EarlyLintPass, LateContext, LateLintPass};
-use rustc_middle::ty::{self, adjustment::Adjust};
+use rustc_lint::{LateContext, LateLintPass};
 use rustc_span::Span;
-use std::{cmp::min, fmt::Write};
 
 dylint_linting::impl_late_lint! {
     pub PROJECT_HELPER,
@@ -59,150 +52,266 @@ impl<'tcx> LateLintPass<'tcx> for ProjectHelper {
         &mut self,
         cx: &LateContext<'tcx>,
         fn_kind: FnKind<'tcx>,
-        _: &'tcx FnDecl<'tcx>,
+        dec: &'tcx FnDecl<'tcx>,
         body: &'tcx Body<'tcx>,
         span: Span,
         lid: LocalDefId,
     ) {
         let (name, span) = match fn_kind {
-            FnKind::Method(i, s) => (i.to_string(), format!("{:?}", span)),
-            FnKind::ItemFn(i, g, h) => (i.to_string(), format!("{:?}", span)),
+            FnKind::Method(i, _s) => (i.to_string(), format!("{:?}", span)),
+            FnKind::ItemFn(i, _g, _h) => (i.to_string(), format!("{:?}", span)),
             FnKind::Closure => ("Closure".to_string(), format!("{:?}", span)),
         };
+        let param_tys = dec
+            .inputs
+            .iter()
+            .map(|v| get_rel_struct_in_ty(v).unwrap_or_else(|e| format!("{:?}", e)))
+            .collect::<Vec<_>>();
         let params = body
             .params
             .iter()
-            .map(|param| {
+            .enumerate()
+            .map(|(index, param)| {
                 let name = snippet(cx, param.pat.span, "..").to_string();
-                model::FnParam { name }
+                model::FnParam {
+                    name,
+                    ty: param_tys
+                        .get(index)
+                        .cloned()
+                        .unwrap_or("unknown".to_string()),
+                }
             })
             .collect::<Vec<_>>();
         let mut calls = Vec::new();
-        scan_call_in_body(&mut calls, body);
+        scan_call_in_body(cx, &mut calls, body);
+        let def_id = format!("{:?}", lid.to_def_id());
+        println!("def_id {:?}", def_id);
         let fi = model::FnItem {
             name,
             span,
             params,
             calls,
+            def_id,
         };
-        let def_id: rustc_hir::def_id::DefId = lid.to_def_id();
-        
+
         println!("Body {:#?}", body);
-        println!("DefId {:#?}", def_id);
-        println!("Path {:#?}\n", cx.tcx.def_path_str(def_id));
         println!("Fnitem {:#?}\n", fi);
     }
 }
 
-fn scan_call_in_stmt<'tcx>(calls: &mut Vec<Call>, stmt: &'tcx Stmt<'tcx>) {
+fn scan_call_in_stmt<'tcx>(cx: &LateContext<'tcx>, calls: &mut Vec<Call>, stmt: &'tcx Stmt<'tcx>) {
     match &stmt.kind {
         StmtKind::Local(lo) => {
-            scan_call_in_local(calls, lo);
+            scan_call_in_local(cx, calls, lo);
+        }
+        StmtKind::Semi(expr) => {
+            scan_call_in_expr(cx, calls, expr);
         }
         _ => {}
     }
 }
 
-fn scan_call_in_local<'tcx>(calls: &mut Vec<Call>, local: &'tcx Local<'tcx>) {
+fn scan_call_in_local<'tcx>(
+    cx: &LateContext<'tcx>,
+    calls: &mut Vec<Call>,
+    local: &'tcx Local<'tcx>,
+) {
     if let Some(expr) = local.init {
-        scan_call_in_expr(calls, expr);
+        scan_call_in_expr(cx, calls, expr);
     }
 }
 
-fn get_call_in_call_expr<'tcx>(expr: &'tcx Expr<'tcx>) -> anyhow::Result<ItemFn> {
+fn get_call_in_call_expr_inner<'tcx>(
+    cx: &LateContext<'tcx>,
+    expr: &'tcx Expr<'tcx>,
+) -> anyhow::Result<ItemFnCall> {
     let qpath = if let ExprKind::Path(pa) = &expr.kind {
         pa
     } else {
-        return Err(anyhow::anyhow!("parse call expr error {:#?}", expr));
+        return Err(anyhow::anyhow!("parse call expr error {:?}", expr));
     };
-    let item = get_call_in_qpath(qpath)?;
+    let hir_id = expr.hir_id;
+    let item = get_call_in_qpath(cx, qpath, hir_id)?;
     Ok(item)
 }
 
-fn scan_call_in_expr<'tcx>(calls: &mut Vec<Call>, expr: &'tcx Expr<'tcx>) {
+fn scan_call_in_expr<'tcx>(cx: &LateContext<'tcx>, calls: &mut Vec<Call>, expr: &'tcx Expr<'tcx>) {
     match &expr.kind {
         ExprKind::Block(bl, _la) => {
             for stmt in bl.stmts {
-                scan_call_in_stmt(calls, stmt);
+                scan_call_in_stmt(cx, calls, stmt);
             }
             if let Some(expr) = bl.expr {
-                scan_call_in_expr(calls, expr);
+                scan_call_in_expr(cx, calls, expr);
             }
         }
         ExprKind::Call(call_expr, exprs) => {
-            match get_call_in_call_expr(call_expr) {
-                Ok(item) => {
-                    calls.push(Call {
-                        inner: model::CallInner::ItemFn(item),
-                        useful: false,
-                        scan_status: true,
-                    });
-                }
-                Err(e) => {
-                    calls.push(Call {
-                        inner: model::CallInner::Closure(format!("{:?}",call_expr.span)),
-                        useful: false,
-                        scan_status: true,
-                    });
-                }
-            };
             exprs
                 .iter()
-                .for_each(|expr_c| scan_call_in_expr(calls, expr_c));
+                .for_each(|expr_c| scan_call_in_expr(cx, calls, expr_c));
+            get_call_in_call_expr(cx, calls, call_expr);
+        }
+        ExprKind::MethodCall(ps, ex, exs, _sp) => {
+            scan_call_in_expr(cx, calls, ex);
+            exs.iter()
+                .for_each(|expr_c| scan_call_in_expr(cx, calls, expr_c));
+            get_method_call_in_call_expr(cx, calls, expr, ps);
+        }
+        ExprKind::Closure(cl) => {
+            calls.push(Call {
+                def_id: format!("{:?}", cl.def_id),
+                inner: model::CallInner::Closure(format!("{:?}", cl.fn_decl_span)),
+                useful: false,
+                scan_status: false,
+            });
         }
         _ => {}
     }
 }
 
-fn get_struct_in_qpath<'tcx>(qpath: &'tcx QPath<'tcx>) -> anyhow::Result<String> {
-    let pa = match &qpath {
-        QPath::Resolved(_ty, pa) => pa,
-        _ => {
-            return Err(anyhow::anyhow!("parse struct path error {:#?}", qpath));
+fn get_method_call_in_call_expr<'tcx>(
+    cx: &LateContext<'tcx>,
+    calls: &mut Vec<Call>,
+    expr: &'tcx Expr<'tcx>,
+    ps: &rustc_hir::PathSegment<'tcx>,
+) {
+    match get_method_call_in_call_expr_inner(cx, expr.hir_id, ps) {
+        Ok(item) => {
+            calls.push(Call {
+                def_id: item.def_id.clone(),
+                inner: model::CallInner::Method(item),
+                useful: false,
+                scan_status: true,
+            });
+        }
+        Err(e) => {
+            calls.push(Call {
+                def_id: "".to_string(),
+                inner: model::CallInner::Closure(format!("{:?} {:?}", ps.ident, e)),
+                useful: false,
+                scan_status: false,
+            });
         }
     };
-    let def = match pa.res {
-        rustc_hir::def::Res::Def(_, def_id) => format!("{:#?}", def_id),
-        _ => {
-            return Err(anyhow::anyhow!("parse struct path error {:#?}", qpath));
-        }
-    };
-
-    Ok(def)
 }
 
-fn get_call_in_qpath<'tcx>(qpath: &'tcx QPath<'tcx>) -> anyhow::Result<ItemFn> {
-    let ans = match &qpath {
-        QPath::TypeRelative(ty, ps) => match &ty.kind {
-            TyKind::Path(qpath) => {
-                let rel_struct = match get_struct_in_qpath(qpath) {
-                    Ok(def) => def,
-                    Err(e) => {
-                        println!("get_call_in_qpath {:#?} {:#?}", qpath, e);
-                        "unknow".to_string()
-                    }
-                };
-                let name = ps.ident.name.to_string();
-                let span = format!("{:?}", ps.ident.span);
-                let res = ps.res;
-                ItemFn {
-                    name,
-                    span,
-                    rel_struct,
-                }
-            }
-            _ => {
-                return Err(anyhow::anyhow!("parse call path error {:#?}", qpath));
-            }
-        },
+fn get_call_in_call_expr<'tcx>(
+    cx: &LateContext<'tcx>,
+    calls: &mut Vec<Call>,
+    call_expr: &'tcx Expr<'tcx>,
+) {
+    match get_call_in_call_expr_inner(cx, call_expr) {
+        Ok(item) => {
+            calls.push(Call {
+                def_id: item.def_id.clone(),
+                inner: model::CallInner::ItemFn(item),
+                useful: false,
+                scan_status: true,
+            });
+        }
+        Err(e) => {
+            calls.push(Call {
+                def_id: "".to_string(),
+                inner: model::CallInner::Closure(format!("{:?} {:?}", call_expr.span, e)),
+                useful: false,
+                scan_status: false,
+            });
+        }
+    };
+}
+
+fn get_def_id_by_res(res: Res) -> anyhow::Result<String> {
+    let def_id = match res {
+        Res::Def(_kd, id) => {
+            format!("{:?}", id)
+        }
+        Res::Local(hir_id) => {
+            let id = hir_id.owner.to_def_id();
+            format!("{:?}", id)
+        }
         _ => {
-            return Err(anyhow::anyhow!("parse call path error {:#?}", qpath));
+            return Err(anyhow::anyhow!("get_def_id_by_res {:?}", res));
+        }
+    };
+    Ok(def_id)
+}
+
+fn get_def_id_by_hir_id<'tcx>(cx: &LateContext<'tcx>, id: HirId) -> anyhow::Result<String> {
+    let res: Res<HirId> = cx
+        .maybe_typeck_results()
+        .filter(|typeck_results| typeck_results.hir_owner == id.owner)
+        .or_else(|| {
+            cx.tcx
+                .has_typeck_results(id.owner.to_def_id())
+                .then(|| cx.tcx.typeck(id.owner.def_id))
+        })
+        .and_then(|typeck_results| typeck_results.type_dependent_def(id))
+        .map_or(Res::Err, |(kind, def_id)| Res::Def(kind, def_id));
+    let def_id = get_def_id_by_res(res)?;
+
+    Ok(def_id)
+}
+
+fn get_method_call_in_call_expr_inner<'tcx>(
+    cx: &LateContext<'tcx>,
+    hir_id: HirId,
+    ps: &rustc_hir::PathSegment<'tcx>,
+) -> anyhow::Result<MethodCall> {
+    let def_id = get_def_id_by_hir_id(cx, hir_id)?;
+    let name = ps.ident.name.to_string();
+    Ok(MethodCall { name, def_id })
+}
+
+fn get_rel_struct_in_ty<'tcx>(ty: &Ty<'tcx>) -> anyhow::Result<String> {
+    let qpath = if let TyKind::Path(qpath) = &ty.kind {
+        qpath
+    } else {
+        return Err(anyhow::anyhow!("get_rel_struct_in_ty 1  {:?}", ty));
+    };
+    let reso = if let QPath::Resolved(_ty, pa) = qpath {
+        pa
+    } else {
+        return Err(anyhow::anyhow!("get_rel_struct_in_ty 2 {:?}", ty));
+    };
+    let def_id = get_def_id_by_res(reso.res)?;
+
+    Ok(def_id)
+}
+
+fn get_call_in_qpath<'tcx>(
+    cx: &LateContext<'tcx>,
+    qpath: &'tcx QPath<'tcx>,
+    hir_id: HirId,
+) -> anyhow::Result<ItemFnCall> {
+    let ans = match &qpath {
+        QPath::TypeRelative(ty, ps) => {
+            let rel_struct = get_rel_struct_in_ty(ty)?;
+            let def_id = get_def_id_by_hir_id(cx, hir_id)?;
+            let name = ps.ident.name.to_string();
+            ItemFnCall {
+                name,
+                def_id,
+                rel_struct,
+            }
+        }
+        QPath::Resolved(_ty, pa) => {
+            let def_id = get_def_id_by_res(pa.res)?;
+            let name = "".to_string();
+            let rel_struct = "".to_string();
+            ItemFnCall {
+                name,
+                def_id,
+                rel_struct,
+            }
+        }
+        _ => {
+            return Err(anyhow::anyhow!("parse call path error {:?}", qpath));
         }
     };
 
     Ok(ans)
 }
 
-fn scan_call_in_body<'tcx>(calls: &mut Vec<Call>, body: &'tcx Body<'tcx>) {
-    scan_call_in_expr(calls, body.value);
+fn scan_call_in_body<'tcx>(cx: &LateContext<'tcx>, calls: &mut Vec<Call>, body: &'tcx Body<'tcx>) {
+    scan_call_in_expr(cx, calls, body.value);
 }
