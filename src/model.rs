@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct FnItem {
     pub name: String,
     pub span: String,
+    pub desp: String,
     pub def_id: String,
     pub params: Vec<FnParam>,
     pub calls: Vec<Call>,
@@ -12,6 +13,7 @@ pub struct FnItem {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FnParam {
     pub name: String,
+    pub desp: String,
     pub ty: String,
 }
 
@@ -39,6 +41,7 @@ pub struct MethodCall {
 pub struct Call {
     pub def_id: String,
     pub inner: CallInner,
+    pub desp: String,
     pub useful: bool,
     pub scan_status: bool,
 }

@@ -20,7 +20,8 @@ extern crate rustc_span;
 // extern crate rustc_target;
 // extern crate rustc_trait_selection;
 
-mod model;
+pub mod model;
+pub mod stroage;
 
 use clippy_utils::source::snippet;
 use model::{Call, ItemFnCall, MethodCall};
@@ -31,6 +32,8 @@ use rustc_hir::{
 };
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_span::Span;
+
+use crate::stroage::GLOBAL_INFO;
 
 dylint_linting::impl_late_lint! {
     pub PROJECT_HELPER,
@@ -71,16 +74,13 @@ impl<'tcx> LateLintPass<'tcx> for ProjectHelper {
             span,
             params,
             calls,
+            desp: "".to_string(),
             def_id: def_id.clone(),
         };
-        let tree = sled::open("ph").unwrap();
         let jfi = serde_json::to_string(&fi).unwrap();
-        let key = format!("fn_{}",def_id);
-        tree.insert(key, jfi.as_bytes()).unwrap();
-        tree.flush().unwrap();
-        println!("def_id {:?}", def_id);
-        println!("Body {:#?}", body);
-        println!("Fnitem {:#?}\n", fi);
+        let key = format!("fn_{}", def_id);
+        GLOBAL_INFO.insert(key, jfi.as_bytes()).unwrap();
+        GLOBAL_INFO.flush().unwrap();
     }
 }
 
@@ -106,6 +106,7 @@ fn get_type_by_desc<'tcx>(
                     .get(index)
                     .cloned()
                     .unwrap_or("unknown".to_string()),
+                desp: "".to_string(),
             }
         })
         .collect::<Vec<_>>();
@@ -172,6 +173,7 @@ fn scan_call_in_expr<'tcx>(cx: &LateContext<'tcx>, calls: &mut Vec<Call>, expr: 
         }
         ExprKind::Closure(cl) => {
             calls.push(Call {
+                desp: "".to_string(),
                 def_id: format!("{:?}", cl.def_id),
                 inner: model::CallInner::Closure(format!("{:?}", cl.fn_decl_span)),
                 useful: false,
@@ -191,6 +193,7 @@ fn get_method_call_in_call_expr<'tcx>(
     match get_method_call_in_call_expr_inner(cx, expr.hir_id, ps) {
         Ok(item) => {
             calls.push(Call {
+                desp: "".to_string(),
                 def_id: item.def_id.clone(),
                 inner: model::CallInner::Method(item),
                 useful: false,
@@ -199,6 +202,7 @@ fn get_method_call_in_call_expr<'tcx>(
         }
         Err(e) => {
             calls.push(Call {
+                desp: "".to_string(),
                 def_id: "".to_string(),
                 inner: model::CallInner::Closure(format!("{:?} {:?}", ps.ident, e)),
                 useful: false,
@@ -216,6 +220,7 @@ fn get_call_in_call_expr<'tcx>(
     match get_call_in_call_expr_inner(cx, call_expr) {
         Ok(item) => {
             calls.push(Call {
+                desp: "".to_string(),
                 def_id: item.def_id.clone(),
                 inner: model::CallInner::ItemFn(item),
                 useful: false,
@@ -224,6 +229,7 @@ fn get_call_in_call_expr<'tcx>(
         }
         Err(e) => {
             calls.push(Call {
+                desp: "".to_string(),
                 def_id: "".to_string(),
                 inner: model::CallInner::Closure(format!("{:?} {:?}", call_expr.span, e)),
                 useful: false,

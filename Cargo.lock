@@ -776,6 +776,8 @@ dependencies = [
  "clippy_utils",
  "dylint_linting",
  "dylint_testing",
+ "lazy_static",
+ "once_cell",
  "serde",
  "serde_json",
  "sled",
